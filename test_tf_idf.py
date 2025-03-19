@@ -1,93 +1,134 @@
-#使用传统TF_IDF模型检查bug报告和与源代码文件相关性
 import json
 import re
-import math
 from pathlib import Path
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+import pandas as pd
 
-def enhanced_preprocessor(text):
-    """增强型文本预处理，保留代码特征"""
-    # 处理驼峰命名（保留原始和分割两种形式）
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    # 保留特殊符号组合（如verilog中的信号声明）
-    text = re.sub(r'([\w])_([\w])', r'\1 \2', text)
-    # 合并数字与单位（如10ns -> 10_ns）
-    text = re.sub(r'(\d+)([a-zA-Z]+)', r'\1_\2', text)
-    # 去除纯数字和单字符
-    return ' '.join([word.lower() for word in re.findall(r'\b[\w.]+\b', text) 
-                    if len(word) > 1 or word in {'x', 'z'}])  # 保留verilog特殊值
+def preprocess_bug_report(text):
+    """处理包含Verilog代码的bug报告"""
+    # 分离自然语言描述和代码部分
+    code_blocks = re.findall(r'```(?:verilog)?\s*(.*?)```', text, re.DOTALL)
+    text_blocks = re.sub(r'```.*?```', ' ', text)
 
-def load_verilog_files(root_dir):
-    """载入所有Verilog/SystemVerilog代码文件"""
+    # 处理自然语言部分
+    text_processed = re.sub(r'\b(?:error|bug|fix)\b', '', text_blocks.lower())
+    text_processed = ' '.join(re.findall(r'\b[\w.]+\b', text_processed))
+
+    # 处理代码部分
+    code_processed = ' '.join([
+        re.sub(r'\b(input|output|wire|reg)\b', '', c)
+        for c in code_blocks
+    ]).lower()
+
+    return f"{text_processed} {code_processed}"
+
+
+def preprocess_cpp_code(text):
+    """预处理C++源代码"""
+    # 保留关键语法结构
+    text = re.sub(r'//.*', '', text)  # 保留行内注释中的技术术语
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+
+    # 处理特殊符号
+    text = re.sub(r'([<>*&])(\w)', r' \1 \2', text)  # 分离操作符
+    text = re.sub(r'(\w)([<>*&])', r'\1 \2 ', text)
+
+    # 保留技术术语
+    tokens = re.findall(r'\b[\w_]+\b', text.lower())
+    return ' '.join([t for t in tokens if len(t) > 1 or t in {'x', 'i'}])
+
+
+def load_cpp_files(code_dir):
+    """加载所有C++文件"""
     code_files = {}
-    extensions = (".c", ".cc", ".cpp", ".h", ".hpp", ".py", ".ts", ".js", ".java", ".lex")
-    
-    for file_path in Path(root_dir).rglob('*'):
+    extensions = (".c", ".cc", ".cpp", ".h", ".hpp")
+
+    for file_path in tqdm(Path(code_dir).rglob('*'), desc="Loading C++ files"):
         if file_path.suffix.lower() in extensions:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                # 移除块注释但保留行内注释
-                content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-                code_files[str(file_path)] = content
+                    code_files[str(file_path)] = preprocess_cpp_code(f.read())
             except Exception as e:
-                print(f"Error reading {file_path}: {str(e)}")
+                print(f"\nError reading {file_path}: {str(e)}")
     return code_files
 
-# 载入数据
-bug_report_path = "/media/oscar6/6F682A90B86D8F9F1/wkb/data/Iverilog/bug_report/bug_report_2.json"
+
+def process_bug_reports(bug_reports_dir, code_files, results):
+    """批量处理bug报告"""
+    bug_report_files = list(Path(bug_reports_dir).glob("*.json"))
+
+    for bug_file in tqdm(bug_report_files, desc="Processing bug reports"):
+        try:
+            with open(bug_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                bug_text = f"{data.get('Summary', '')} {data.get('Description', '')}".strip()
+
+            # 预处理bug报告
+            processed_bug = preprocess_bug_report(bug_text)
+
+            # 构建TF-IDF矩阵
+            corpus = [processed_bug] + list(code_files.values())
+            vectorizer = TfidfVectorizer(
+                ngram_range=(1, 2),
+                max_features=8000,
+                token_pattern=r'(?u)\b\w[\w.]+\b'
+            )
+            tfidf_matrix = vectorizer.fit_transform(corpus)
+
+            # 计算相似度
+            similarities = cosine_similarity(tfidf_matrix[0], tfidf_matrix[1:]).flatten()
+            sorted_indices = similarities.argsort()[::-1][:30]
+
+            # 收集结果
+            results[bug_file.name] = []
+            file_paths = list(code_files.keys())
+
+            for idx in sorted_indices:
+                if similarities[idx] < 0.005:  # 过滤低相似度结果
+                    continue
+
+                result = {
+                    "file": Path(file_paths[idx]).name,
+                    "path": file_paths[idx],
+                    "score": float(similarities[idx]),
+                    "keywords": vectorizer.get_feature_names_out()[
+                        tfidf_matrix[0].toarray().argsort()[0][-5:][::-1]
+                    ].tolist()
+                }
+                results[bug_file.name].append(result)
+
+        except Exception as e:
+            print(f"\nError processing {bug_file.name}: {str(e)}")
+
+
+# 配置路径
+bug_reports_dir = "/media/oscar6/6F682A90B86D8F9F1/wkb/data/Iverilog/bug_report"
 code_dir = "/media/oscar6/6F682A90B86D8F9F1/wkb/data/only_code/iverilog"
 
-# 读取bug报告
-with open(bug_report_path, "r", encoding="utf-8") as f:
-    bug_report_data = json.load(f)
-    summary = bug_report_data.get("Summary", "")
-    description = bug_report_data.get("Description", "")
-    bug_report = f"{summary} {description}".strip()
-    print("bug报告:",bug_report)
+# 初始化数据
+print("Initializing...")
+code_data = load_cpp_files(code_dir)
+results = {}
 
-# 载入所有代码文件
-code_files = load_verilog_files(code_dir)
-print(f"Loaded {len(code_files)} code files")
+# 执行处理流程
+process_bug_reports(bug_reports_dir, code_data, results)
 
-# 预处理所有文本
-all_texts = [enhanced_preprocessor(bug_report)] + [enhanced_preprocessor(c) for c in code_files.values()]
+with open('full_results.json', 'w') as f:
+    json.dump(results, f, indent=2)
 
-# 构建TF-IDF模型（针对Verilog优化）
-vectorizer = TfidfVectorizer(
-    preprocessor=lambda x: x,
-    token_pattern=r'(?u)\b\w[\w.]*\b',  # 允许包含点号（如模块引用）
-    ngram_range=(1, 3),
-    max_features=10000,
-    stop_words=None  # 不过滤技术术语
-)
 
-tfidf_matrix = vectorizer.fit_transform(all_texts)
-# 分离bug报告和代码的向量
-bug_vector = tfidf_matrix[0]
-print("bug报告向量:",bug_vector)
-code_vectors = tfidf_matrix[1:]
-
-# 计算相似度
-similarities = cosine_similarity(bug_vector, code_vectors).flatten()
-
-# 生成排序结果
-file_list = list(code_files.keys())
-sorted_indices = similarities.argsort()[::-1]
-
-# 输出可解释的结果
-print(f"\nBug Report: {bug_report[:200]}...\n")
-print("Top 10 Matches:")
-for i in sorted_indices[:30]:
-    score = similarities[i]
-    file_path = file_list[i]
-    # 计算匹配词权重
-    feature_names = vectorizer.get_feature_names_out()
-    sorted_indices_feature = bug_vector.toarray().argsort()[0][::-1]
-    top_keywords = [feature_names[j] for j in sorted_indices_feature[:5]]
-    
-    print(f"{Path(file_path).name}")
-    print(f"  Similarity: {score:.4f}")
-    print(f"  Path: {file_path}")
-    print(f"  Keywords: {', '.join(top_keywords)}\n")
+df = pd.DataFrame([
+    {"bug": k, "file": x["file"], "score": x["score"]} 
+    for k, v in results.items() 
+    for x in v
+])
+df.to_csv("cross_language_matches.csv", index=False)
+# 输出结果示例
+print("\nProcessing complete. Sample output:")
+for bug_name in list(results.keys())[:1]:
+    print(f"\nBug Report: {bug_name}")
+    for item in results[bug_name][:3]:
+        print(f"  {item['file']} ({item['score']:.4f})")
+        print(f"    Keywords: {item['keywords']}")
