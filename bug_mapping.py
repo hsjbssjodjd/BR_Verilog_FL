@@ -16,7 +16,7 @@ with open(csv_file_path, "r", encoding="utf-8") as file:
 
     for idx, row in enumerate(reader, start=1):
         bug_report_name = f"bug_report_{idx}.json"
-        bug_files = row[0]  # 第五列是 bug file
+        bug_files = row[4]  # 第五列是 bug file
 
         # 处理路径中的 `/` 变为 `_`
         processed_files = [file.replace("/", "_") for file in bug_files.split(",")]
